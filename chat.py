@@ -173,7 +173,7 @@ if not name:
 
 # Состояние выбранной переписки
 active_peer = None
-last_count = -1
+last_signature = None
 image_refs = []
 known_contacts = set()
 
@@ -209,11 +209,15 @@ right.grid(row=0, column=1, sticky="nsew", padx=(4, 8), pady=8)
 right.grid_rowconfigure(1, weight=1)
 right.grid_columnconfigure(0, weight=1)
 
+chat_header = ctk.CTkFrame(right, fg_color="transparent")
+chat_header.grid(row=0, column=0, sticky="ew", padx=8, pady=8)
+chat_header.grid_columnconfigure(0, weight=1)
+
 chat_title = ctk.CTkLabel(
-    right, text="Выберите чат или найдите пользователя",
+    chat_header, text="Выберите чат или найдите пользователя",
     font=("Segoe UI", 15, "bold"), anchor="w"
 )
-chat_title.grid(row=0, column=0, sticky="ew", padx=14, pady=14)
+chat_title.grid(row=0, column=0, sticky="ew", padx=6, pady=6)
 
 messages = ctk.CTkScrollableFrame(right, corner_radius=14, fg_color="#e8e5df")
 messages.grid(row=1, column=0, sticky="nsew", padx=8, pady=4)
@@ -228,27 +232,174 @@ entry = ctk.CTkEntry(
 )
 entry.grid(row=0, column=0, sticky="ew", padx=(10, 5), pady=9)
 
+
+def conversation_key(msg):
+    if msg.get("chat_type") == "group" or msg.get("type") == "group_message":
+        group_id = msg.get("group_id") or msg.get("recipient") or "unknown"
+        return f"group:{str(group_id).casefold()}"
+
+    participants = sorted({
+        str(msg.get("sender", "")).casefold(),
+        str(msg.get("recipient", "")).casefold()
+    })
+    return "dm:" + "|".join(participants)
+
+
 def read_messages():
+    """Load message records and apply append-only deletion events."""
+    records = []
     try:
         with open(CHAT_FILE, encoding="utf-8") as f:
-            return [json.loads(line) for line in f if line.strip()]
-    except FileNotFoundError:
+            for line_number, line in enumerate(f):
+                if not line.strip():
+                    continue
+                try:
+                    record = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(record, dict):
+                    records.append((line_number, line, record))
+    except (FileNotFoundError, OSError):
         return []
-    except (OSError, json.JSONDecodeError):
-        return []
+
+    messages_by_id = {}
+    ordered_ids = []
+    delete_events = []
+    chat_clear_events = []
+
+    for position, raw_line, record in records:
+        if record.get("record_type") == "delete_message":
+            delete_events.append((position, record))
+            continue
+        if record.get("record_type") == "delete_chat":
+            chat_clear_events.append((position, record))
+            continue
+
+        # Старые сообщения без ID остаются адресуемыми после перезапуска.
+        message_id = record.get("id") or hashlib.sha256(
+            f"{position}\0{raw_line}".encode("utf-8")
+        ).hexdigest()
+        record["id"] = message_id
+        messages_by_id[message_id] = (position, record)
+        ordered_ids.append(message_id)
+
+    deleted_ids = set()
+    for _position, event in delete_events:
+        target = messages_by_id.get(event.get("message_id"))
+        if not target:
+            continue
+        _target_position, target_msg = target
+        requester = str(event.get("requester", "")).casefold()
+        sender = str(target_msg.get("sender", "")).casefold()
+        recipient = str(target_msg.get("recipient", "")).casefold()
+        is_group = (
+            target_msg.get("chat_type") == "group"
+            or target_msg.get("type") == "group_message"
+        )
+        if (is_group and requester == sender) or (
+            not is_group and requester in {sender, recipient}
+        ):
+            deleted_ids.add(event.get("message_id"))
+
+    # Удаление чата скрывает историю только у удалившего пользователя.
+    # Новые сообщения в этой переписке после события снова появятся.
+    clear_positions = {}
+    for position, event in chat_clear_events:
+        user_key = str(event.get("user", "")).casefold()
+        chat_key = event.get("chat_key")
+        if user_key and chat_key:
+            clear_positions[(user_key, chat_key)] = position
+
+    current_user = name.casefold()
+    visible = []
+    for message_id in ordered_ids:
+        position, msg = messages_by_id[message_id]
+        if message_id in deleted_ids:
+            continue
+        cutoff = clear_positions.get((current_user, conversation_key(msg)))
+        if cutoff is not None and position <= cutoff:
+            continue
+        visible.append(msg)
+    return visible
+
+
+def append_event(event):
+    with open(CHAT_FILE, "a", encoding="utf-8") as f:
+        f.write(json.dumps(event, ensure_ascii=False) + "\n")
+
 
 def clear_frame(frame):
     for widget in frame.winfo_children():
         widget.destroy()
 
+
 def select_peer(peer):
-    global active_peer, last_count
+    global active_peer, last_signature
     if peer.casefold() == name.casefold():
         return
     active_peer = peer
     chat_title.configure(text=peer)
-    last_count = -1
+    last_signature = None
     refresh()
+
+
+def delete_chat(peer):
+    if not messagebox.askyesno(
+        "Удалить чат",
+        f"Скрыть историю переписки с пользователем {peer} только у вас?"
+    ):
+        return
+
+    chat_key = "dm:" + "|".join(sorted({name.casefold(), peer.casefold()}))
+    try:
+        append_event({
+            "record_type": "delete_chat",
+            "user": name,
+            "chat_key": chat_key,
+            "time": datetime.now().isoformat(timespec="seconds")
+        })
+    except OSError as e:
+        messagebox.showerror("Ошибка удаления чата", str(e))
+        return
+
+    global active_peer, last_signature
+    if active_peer and active_peer.casefold() == peer.casefold():
+        active_peer = None
+        chat_title.configure(text="Выберите чат или найдите пользователя")
+        clear_frame(messages)
+        image_refs.clear()
+    last_signature = None
+    refresh()
+
+
+def delete_message(msg):
+    is_group = (
+        msg.get("chat_type") == "group"
+        or msg.get("type") == "group_message"
+    )
+    own = msg.get("sender", "").casefold() == name.casefold()
+    if is_group and not own:
+        return
+
+    prompt = "Удалить это сообщение? Оно исчезнет у всех участников чата."
+    if not messagebox.askyesno("Удалить сообщение", prompt):
+        return
+
+    try:
+        append_event({
+            "record_type": "delete_message",
+            "message_id": msg["id"],
+            "requester": name,
+            "time": datetime.now().isoformat(timespec="seconds")
+        })
+    except OSError as e:
+        messagebox.showerror("Ошибка удаления сообщения", str(e))
+        return
+
+    global last_signature
+    last_signature = None
+    refresh()
+
 
 def search_users(event=None):
     clear_frame(search_results)
@@ -274,6 +425,7 @@ def search_users(event=None):
             command=lambda p=peer: select_peer(p)
         ).pack(fill="x", pady=2)
 
+
 def update_contacts(all_messages):
     global known_contacts
     peers = set()
@@ -292,14 +444,27 @@ def update_contacts(all_messages):
         known_contacts = peers
         clear_frame(contacts)
         for peer in sorted(peers, key=str.casefold):
+            row = ctk.CTkFrame(contacts, fg_color="transparent")
+            row.pack(fill="x", padx=3, pady=3)
             ctk.CTkButton(
-                contacts, text=peer, anchor="w",
+                row, text=peer, anchor="w",
                 corner_radius=12, height=38,
                 command=lambda p=peer: select_peer(p)
-            ).pack(fill="x", padx=3, pady=3)
+            ).pack(side="left", fill="x", expand=True)
+            ctk.CTkButton(
+                row, text="×", width=34, height=34, corner_radius=10,
+                fg_color="transparent", text_color="#b42318",
+                hover_color="#f8d7da",
+                command=lambda p=peer: delete_chat(p)
+            ).pack(side="right", padx=(4, 0))
+
 
 def show_message(msg):
     own = msg.get("sender", "").casefold() == name.casefold()
+    is_group = (
+        msg.get("chat_type") == "group"
+        or msg.get("type") == "group_message"
+    )
     color = "#d9fdd3" if own else "white"
 
     bubble = ctk.CTkFrame(messages, corner_radius=16, fg_color=color)
@@ -338,6 +503,17 @@ def show_message(msg):
             command=lambda f=filename: open_attachment(f)
         ).pack(anchor="w", padx=8, pady=(3, 8))
 
+    # В личной переписке любой из участников может удалить сообщение;
+    # в групповой — только автор.
+    if not is_group or own:
+        ctk.CTkButton(
+            bubble, text="Удалить сообщение", width=130, height=26,
+            corner_radius=10, fg_color="transparent",
+            text_color="#b42318", hover_color="#f8d7da",
+            command=lambda m=msg: delete_message(m)
+        ).pack(anchor="e", padx=8, pady=(0, 7))
+
+
 def send(text=None, attachment=None):
     if not active_peer:
         messagebox.showinfo("Выберите чат", "Найдите пользователя или выберите переписку.")
@@ -348,6 +524,7 @@ def send(text=None, attachment=None):
         return
 
     msg = {
+        "id": uuid.uuid4().hex,
         "sender": name,
         "recipient": active_peer,
         "time": datetime.now().strftime("%H:%M"),
@@ -361,38 +538,51 @@ def send(text=None, attachment=None):
             shutil.copy2(attachment, os.path.join(ATTACH_DIR, filename))
             msg["file"] = filename
 
-        with open(CHAT_FILE, "a", encoding="utf-8") as f:
-            f.write(json.dumps(msg, ensure_ascii=False) + "\n")
+        append_event(msg)
         entry.delete(0, "end")
     except OSError as e:
         messagebox.showerror("Ошибка отправки", str(e))
+
 
 def choose_file():
     path = filedialog.askopenfilename(title="Выберите фото или файл")
     if path:
         send(attachment=path)
 
+
 def refresh():
-    global last_count
+    global last_signature
 
     all_messages = read_messages()
     update_contacts(all_messages)
 
-    if active_peer and len(all_messages) != last_count:
-        clear_frame(messages)
-        image_refs.clear()
+    if active_peer:
+        peer_key = active_peer.casefold()
+        current_messages = [
+            msg for msg in all_messages
+            if {str(msg.get("sender", "")).casefold(),
+                str(msg.get("recipient", "")).casefold()}
+            == {name.casefold(), peer_key}
+        ]
+        signature = tuple(msg.get("id") for msg in current_messages)
 
-        for msg in all_messages:
-            sender = msg.get("sender", "").casefold()
-            recipient = msg.get("recipient", "").casefold()
-            participants = {sender, recipient}
-            if participants == {name.casefold(), active_peer.casefold()}:
+        if signature != last_signature:
+            clear_frame(messages)
+            image_refs.clear()
+            for msg in current_messages:
                 show_message(msg)
-
-        last_count = len(all_messages)
-        messages.after(100, lambda: messages._parent_canvas.yview_moveto(1))
+            last_signature = signature
+            messages.after(100, lambda: messages._parent_canvas.yview_moveto(1))
 
     app.after(1200, refresh)
+
+
+ctk.CTkButton(
+    chat_header, text="Удалить чат", width=100, height=30,
+    corner_radius=10, fg_color="transparent", text_color="#b42318",
+    hover_color="#f8d7da",
+    command=lambda: delete_chat(active_peer) if active_peer else None
+).grid(row=0, column=1, padx=6, pady=4)
 
 search.bind("<KeyRelease>", search_users)
 search.bind("<Return>", search_users)
